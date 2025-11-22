@@ -1,0 +1,6 @@
+langgraph~=1.0.0
+langchain[openai]
+langchain-community
+langchain-text-splitters
+sqlparse
+nltk
