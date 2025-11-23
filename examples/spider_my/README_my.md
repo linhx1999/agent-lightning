@@ -1,6 +1,6 @@
 # My Spider Example
 
-This example demonstrates how to train a text-to-SQL agent on the Spider dataset using Agent-Lightning with reinforcement learning. It's compatible with Agent-lightning v0.2 or later.
+This example demonstrates how to train a text-to-SQL agent on the Spider dataset using Agent-Lightning with reinforcement learning. It's compatible with Agent-lightning v1 or later.
 
 ## Requirements
 
@@ -21,6 +21,12 @@ uv pip install "flash-attn~=2.7.0" --no-build-isolation
 Additionally, follow the [installation guide](../../docs/tutorials/installation.md) to install Agent-Lightning and VERL-related dependencies.
 
 ## Dataset
+
+```bash
+gdown --fuzzy https://drive.google.com/file/d/1oi9J1jZP9TyM35L85CL3qeGWl2jqlnL6/view
+unzip -q spider-data.zip -d data
+rm spider-data.zipz
+```
 
 Detailed dataset preparation instructions are available in the [How to Train a SQL Agent](../../docs/how-to/train-sql-agent.md) guide.
 
