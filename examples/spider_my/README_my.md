@@ -7,11 +7,13 @@ This example demonstrates how to train a text-to-SQL agent on the Spider dataset
 This example depends on LangChain v1.0 and several SQL-related libraries. Install the required dependencies with:
 
 ```bash
-conda create -n agent--lightning-examples-spider_my python=3.12 -y
-conda activate agent--lightning-examples-spider_my
+conda create -n agent-lightning--examples--spider_my python=3.12 -y
+conda activate agent-lightning--examples--spider_my
 
 pip install uv
 uv pip install -r requirements.txt
+
+uv pip install -e ../../.[verl]
 ```
 
 Additionally, follow the [installation guide](../../docs/tutorials/installation.md) to install Agent-Lightning and VERL-related dependencies.

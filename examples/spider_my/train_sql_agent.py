@@ -46,12 +46,14 @@ RL_TRAINING_CONFIG: Dict[str, Any] = {
     },
     "actor_rollout_ref": {
         "rollout": {
-            "tensor_model_parallel_size": 1,
+            # "tensor_model_parallel_size": 1,
+            "tensor_model_parallel_size": 2,
             "n": 4,
             "log_prob_micro_batch_size_per_gpu": 4,
             "multi_turn": {"format": "hermes"},
             "name": "vllm",
-            "gpu_memory_utilization": 0.8,
+            # "gpu_memory_utilization": 0.8,
+            "gpu_memory_utilization": 0.9,
             "engine_kwargs": {
                 "vllm": {
                     "enable_auto_tool_choice": True,
@@ -78,7 +80,8 @@ RL_TRAINING_CONFIG: Dict[str, Any] = {
             "fsdp_config": {"param_offload": True},
         },
         "model": {
-            "path": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+            # "path": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+            "path": "/mnt/data/hf_models/Qwen2.5-Coder-1.5B-Instruct",
             "use_remove_padding": True,
             "enable_gradient_checkpointing": True,
         },
