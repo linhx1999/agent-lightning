@@ -14,6 +14,8 @@ pip install uv
 uv pip install -r requirements.txt
 
 uv pip install -e ../../.[verl]
+uv pip install "torch~=2.7.0"
+uv pip install "flash-attn~=2.7.0" --no-build-isolation
 ```
 
 Additionally, follow the [installation guide](../../docs/tutorials/installation.md) to install Agent-Lightning and VERL-related dependencies.
