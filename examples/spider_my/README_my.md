@@ -11,16 +11,33 @@ conda create -n agent-lightning--examples--spider_my python=3.12 -y
 conda activate agent-lightning--examples--spider_my
 
 pip install uv
-uv pip install -r requirements.txt
-
 uv pip install -e ../../.[verl]
+uv pip install -r requirements.txt
+uv pip install flash-attn --no-build-isolation
 ```
 
 Additionally, follow the [installation guide](../../docs/tutorials/installation.md) to install Agent-Lightning and VERL-related dependencies.
 
 ## Dataset
 
-Detailed dataset preparation instructions are available in the [How to Train a SQL Agent](../../docs/how-to/train-sql-agent.md) guide.
+The trainer expects three Parquet files inside `examples/spider/data`:
+`train_spider.parquet`, `test_dev_500.parquet`, and `test_dev.parquet`.
+
+Download the curated dataset bundle provided with the repository:
+
+```bash
+gdown --fuzzy https://drive.google.com/file/d/1oi9J1jZP9TyM35L85CL3qeGWl2jqlnL6/view
+unzip -q spider-data.zip -d data
+rm spider-data.zip
+```
+
+If you prefer to generate the files yourself, download [Spider 1.0](https://yale-lily.github.io/spider) and run:
+
+```bash
+python spider_eval/convert_dataset.py
+```
+
+Set `VERL_SPIDER_DATA_DIR` if you store the dataset outside the default `data` directory.
 
 ## Included Files
 
