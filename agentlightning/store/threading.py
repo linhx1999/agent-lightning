@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from opentelemetry.sdk.trace import ReadableSpan
 
@@ -11,6 +11,7 @@ from agentlightning.types import (
     Attempt,
     AttemptedRollout,
     AttemptStatus,
+    EnqueueRolloutRequest,
     NamedResources,
     ResourcesUpdate,
     Rollout,
@@ -22,7 +23,7 @@ from agentlightning.types import (
     WorkerStatus,
 )
 
-from .base import UNSET, LightningStore, LightningStoreCapabilities, Unset
+from .base import UNSET, LightningStore, LightningStoreCapabilities, LightningStoreStatistics, Unset
 
 
 class LightningStoreThreaded(LightningStore):
@@ -47,6 +48,11 @@ class LightningStoreThreaded(LightningStore):
             "thread_safe": True,
         }
 
+    async def statistics(self) -> LightningStoreStatistics:
+        """Return the statistics of the store."""
+        with self._lock:
+            return await self.store.statistics()
+
     async def start_rollout(
         self,
         input: TaskInput,
@@ -54,9 +60,17 @@ class LightningStoreThreaded(LightningStore):
         resources_id: str | None = None,
         config: RolloutConfig | None = None,
         metadata: Dict[str, Any] | None = None,
+        worker_id: Optional[str] = None,
     ) -> AttemptedRollout:
         with self._lock:
-            return await self.store.start_rollout(input, mode, resources_id, config, metadata)
+            return await self.store.start_rollout(
+                input,
+                mode,
+                resources_id,
+                config,
+                metadata,
+                worker_id,
+            )
 
     async def enqueue_rollout(
         self,
@@ -69,13 +83,26 @@ class LightningStoreThreaded(LightningStore):
         with self._lock:
             return await self.store.enqueue_rollout(input, mode, resources_id, config, metadata)
 
+    async def enqueue_many_rollouts(self, rollouts: Sequence[EnqueueRolloutRequest]) -> Sequence[Rollout]:
+        with self._lock:
+            return await self.store.enqueue_many_rollouts(rollouts)
+
     async def dequeue_rollout(self, worker_id: Optional[str] = None) -> Optional[AttemptedRollout]:
         with self._lock:
             return await self.store.dequeue_rollout(worker_id=worker_id)
 
-    async def start_attempt(self, rollout_id: str) -> AttemptedRollout:
+    async def dequeue_many_rollouts(
+        self,
+        *,
+        limit: int = 1,
+        worker_id: Optional[str] = None,
+    ) -> Sequence[AttemptedRollout]:
         with self._lock:
-            return await self.store.start_attempt(rollout_id)
+            return await self.store.dequeue_many_rollouts(limit=limit, worker_id=worker_id)
+
+    async def start_attempt(self, rollout_id: str, worker_id: Optional[str] = None) -> AttemptedRollout:
+        with self._lock:
+            return await self.store.start_attempt(rollout_id, worker_id)
 
     async def query_rollouts(
         self,
@@ -167,7 +194,11 @@ class LightningStoreThreaded(LightningStore):
         with self._lock:
             return await self.store.get_latest_resources()
 
-    async def add_span(self, span: Span) -> Span:
+    async def add_many_spans(self, spans: Sequence[Span]) -> Sequence[Span]:
+        with self._lock:
+            return await self.store.add_many_spans(spans)
+
+    async def add_span(self, span: Span) -> Optional[Span]:
         with self._lock:
             return await self.store.add_span(span)
 
@@ -177,7 +208,7 @@ class LightningStoreThreaded(LightningStore):
         attempt_id: str,
         readable_span: ReadableSpan,
         sequence_id: int | None = None,
-    ) -> Span:
+    ) -> Optional[Span]:
         with self._lock:
             return await self.store.add_otel_span(rollout_id, attempt_id, readable_span, sequence_id)
 
@@ -188,6 +219,10 @@ class LightningStoreThreaded(LightningStore):
     async def get_next_span_sequence_id(self, rollout_id: str, attempt_id: str) -> int:
         with self._lock:
             return await self.store.get_next_span_sequence_id(rollout_id, attempt_id)
+
+    async def get_many_span_sequence_ids(self, rollout_attempt_ids: Sequence[Tuple[str, str]]) -> Sequence[int]:
+        with self._lock:
+            return await self.store.get_many_span_sequence_ids(rollout_attempt_ids)
 
     async def query_spans(
         self,

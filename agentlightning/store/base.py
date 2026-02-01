@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Sequence, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 from opentelemetry.sdk.trace import ReadableSpan
 
@@ -10,10 +10,12 @@ from agentlightning.types import (
     Attempt,
     AttemptedRollout,
     AttemptStatus,
+    EnqueueRolloutRequest,
     NamedResources,
     ResourcesUpdate,
     Rollout,
     RolloutConfig,
+    RolloutMode,
     RolloutStatus,
     Span,
     TaskInput,
@@ -70,6 +72,35 @@ class LightningStoreCapabilities(TypedDict, total=False):
     """Whether the store supports OTLP/HTTP traces."""
 
 
+class LightningStoreStatistics(TypedDict, total=False):
+    """Statistics of a LightningStore implementation."""
+
+    name: str
+    """Name of the store implementation."""
+    total_rollouts: int
+    """Total number of rollouts in the store."""
+    total_attempts: int
+    """Total number of attempts in the store."""
+    total_spans: int
+    """Total number of spans in the store."""
+    total_resources: int
+    """Total number of resources in the store."""
+    total_workers: int
+    """Total number of workers in the store."""
+    uptime: float
+    """Uptime of since the store has been started."""
+
+    # Memory-related statistics
+    total_span_bytes: int
+    """Total number of bytes of spans in the store."""
+    eviction_threshold_bytes: int
+    """Eviction threshold for spans in bytes."""
+    safe_threshold_bytes: int
+    """Safe threshold for spans in bytes."""
+    memory_capacity_bytes: int
+    """Memory capacity of the store in bytes."""
+
+
 class LightningStore:
     """Contract for the persistent control-plane that coordinates training rollouts.
 
@@ -102,6 +133,12 @@ class LightningStore:
             otlp_traces=False,
         )
 
+    async def statistics(self) -> LightningStoreStatistics:
+        """Return the statistics of the store."""
+        return {
+            "name": self.__class__.__name__,
+        }
+
     def otlp_traces_endpoint(self) -> str:
         """Return the OTLP/HTTP traces endpoint of the store.
 
@@ -121,10 +158,11 @@ class LightningStore:
     async def start_rollout(
         self,
         input: TaskInput,
-        mode: Literal["train", "val", "test"] | None = None,
+        mode: RolloutMode | None = None,
         resources_id: str | None = None,
         config: RolloutConfig | None = None,
         metadata: Dict[str, Any] | None = None,
+        worker_id: str | None = None,
     ) -> AttemptedRollout:
         """Register a rollout and immediately create its first attempt.
 
@@ -147,6 +185,7 @@ class LightningStore:
             resources_id: Concrete resource snapshot to execute against; defaults to the latest stored snapshot.
             config: Rollout retry/timeout policy. Should default to a fresh [`RolloutConfig`][agentlightning.RolloutConfig].
             metadata: Free-form metadata persisted verbatim with the rollout.
+            worker_id: Optional worker identifier to associate the new attempt with.
 
         Returns:
             The fully-populated [`AttemptedRollout`][agentlightning.AttemptedRollout] including
@@ -192,6 +231,22 @@ class LightningStore:
         """
         raise NotImplementedError()
 
+    async def enqueue_many_rollouts(self, rollouts: Sequence[EnqueueRolloutRequest]) -> Sequence[Rollout]:
+        """Persist multiple rollouts in `queuing` state.
+
+        The implementation can delegate to [`enqueue_rollout()`][agentlightning.LightningStore.enqueue_rollout]
+        per request and preserves the input ordering. Subclasses can override to provide
+        more efficient bulk enqueue semantics.
+
+        Args:
+            rollouts: Rollout submission payloads mirroring [`enqueue_rollout()`][agentlightning.LightningStore.enqueue_rollout]'s
+                parameters. Each entry requires `input` and can optionally include other fields.
+
+        Returns:
+            Rollouts enqueued in the same order as `rollouts`.
+        """
+        raise NotImplementedError()
+
     async def dequeue_rollout(self, worker_id: Optional[str] = None) -> Optional[AttemptedRollout]:
         """Claim the oldest queued rollout and transition it to `preparing`.
 
@@ -208,6 +263,9 @@ class LightningStore:
         * Optionally refresh the caller's [`Worker`][agentlightning.Worker] telemetry
           (e.g., `last_dequeue_time`) when `worker_id` is provided.
 
+        Args:
+            worker_id: Optional worker identifier to associate the claimed attempt with.
+
         Returns:
             The next attempt to execute, or `None` when no eligible rollouts are queued.
 
@@ -216,7 +274,30 @@ class LightningStore:
         """
         raise NotImplementedError()
 
-    async def start_attempt(self, rollout_id: str) -> AttemptedRollout:
+    async def dequeue_many_rollouts(
+        self,
+        *,
+        limit: int = 1,
+        worker_id: Optional[str] = None,
+    ) -> Sequence[AttemptedRollout]:
+        """Claim up to `limit` queued rollouts without blocking.
+
+        The implementation can repeatedly invokes
+        [`dequeue_rollout()`][agentlightning.LightningStore.dequeue_rollout] until reaching
+        the requested limit or the queue is empty. Subclasses can override it to fetch
+        multiple rollouts atomically.
+
+        Args:
+            limit: Maximum number of rollouts to claim. Non-positive values return an empty list.
+            worker_id: Optional worker identifier passed through to each dequeue call.
+
+        Returns:
+            Attempted rollouts claimed in FIFO order. May contain fewer than `limit` entries
+            when the queue is exhausted.
+        """
+        raise NotImplementedError()
+
+    async def start_attempt(self, rollout_id: str, worker_id: Optional[str] = None) -> AttemptedRollout:
         """Create a manual retry attempt for an existing rollout.
 
         This is typically invoked by runners that wish to retry outside of the
@@ -227,6 +308,7 @@ class LightningStore:
 
         Args:
             rollout_id: Unique identifier of the rollout receiving a new attempt.
+            worker_id: Optional worker identifier to associate the new attempt with.
 
         Returns:
             The rollout paired with its newly-created attempt.
@@ -237,7 +319,15 @@ class LightningStore:
         """
         raise NotImplementedError()
 
-    async def add_span(self, span: Span) -> Span:
+    async def add_many_spans(self, spans: Sequence[Span]) -> Sequence[Span]:
+        """Persist a sequence of pre-constructed spans emitted during rollout execution.
+
+        Implementations can simply delegate to [`add_span()`][agentlightning.LightningStore.add_span] for each span.
+        However, if the store supports bulk insertion, it can implement this method to improve performance.
+        """
+        raise NotImplementedError()
+
+    async def add_span(self, span: Span) -> Optional[Span]:
         """Persist a pre-constructed span emitted during rollout execution.
 
         The provided [`Span`][agentlightning.Span] must already contain the `rollout_id`,
@@ -254,6 +344,7 @@ class LightningStore:
 
         Returns:
             The stored span record (implementations may return a copy).
+            Return `None` if the span was not added due to a duplicate.
 
         Raises:
             NotImplementedError: Subclasses must implement span persistence.
@@ -267,7 +358,7 @@ class LightningStore:
         attempt_id: str,
         readable_span: ReadableSpan,
         sequence_id: int | None = None,
-    ) -> Span:
+    ) -> Optional[Span]:
         """Convert and persist an OpenTelemetry span for a particular attempt.
 
         Implementations must transform the `readable_span` into a [`Span`][agentlightning.Span]
@@ -284,7 +375,7 @@ class LightningStore:
                 automatically.
 
         Returns:
-            The stored span record.
+            The stored span record. Return `None` if the span was not added due to a duplicate.
 
         Raises:
             NotImplementedError: Subclasses must implement span persistence.
@@ -485,6 +576,20 @@ class LightningStore:
         """
         raise NotImplementedError()
 
+    async def get_many_span_sequence_ids(self, rollout_attempt_ids: Sequence[Tuple[str, str]]) -> Sequence[int]:
+        """Bulk allocate the next strictly increasing sequence number used to order spans.
+
+        Implementations may delegate to [`get_next_span_sequence_id()`][agentlightning.LightningStore.get_next_span_sequence_id]
+        for each rollout and attempt.
+
+        Args:
+            rollout_attempt_ids: List of tuples of rollout and attempt identifiers.
+
+        Returns:
+            List of sequence numbers.
+        """
+        raise NotImplementedError()
+
     async def wait_for_rollouts(self, *, rollout_ids: List[str], timeout: Optional[float] = None) -> List[Rollout]:
         """Block until the targeted rollouts reach a terminal status or the timeout expires.
 
@@ -661,7 +766,8 @@ class LightningStore:
 
         When `attempt_id` is `"latest"` the update must target the attempt with the highest
         `sequence_id`; otherwise it must target the specific attempt. Implementations should
-        propagate status changes to the rollout (for example via [`propagate_status()`][agentlightning.store.utils.propagate_status])
+        propagate status changes to the rollout (for example
+        via [`rollout_status_from_attempt()`][agentlightning.store.utils.rollout_status_from_attempt])
         once the latest attempt transitions to a terminal state.
 
         Similar to [`update_rollout()`][agentlightning.LightningStore.update_rollout],

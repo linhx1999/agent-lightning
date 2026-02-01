@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from opentelemetry.sdk.trace import ReadableSpan
 
@@ -10,6 +10,7 @@ from agentlightning.types import (
     Attempt,
     AttemptedRollout,
     AttemptStatus,
+    EnqueueRolloutRequest,
     NamedResources,
     ResourcesUpdate,
     Rollout,
@@ -42,8 +43,9 @@ class DummyLightningStore(LightningStore):
         resources_id: Optional[str] = None,
         config: Optional[RolloutConfig] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
     ) -> AttemptedRollout:
-        self.calls.append(("start_rollout", (input, mode, resources_id, config, metadata), {}))
+        self.calls.append(("start_rollout", (input, mode, resources_id, config, metadata, worker_id), {}))
         return self.return_values["start_rollout"]
 
     async def enqueue_rollout(
@@ -57,12 +59,25 @@ class DummyLightningStore(LightningStore):
         self.calls.append(("enqueue_rollout", (input, mode, resources_id, config, metadata), {}))
         return self.return_values["enqueue_rollout"]
 
+    async def enqueue_many_rollouts(self, rollouts: Sequence[EnqueueRolloutRequest]) -> Sequence[Rollout]:
+        self.calls.append(("enqueue_many_rollouts", (rollouts,), {}))
+        return self.return_values["enqueue_many_rollouts"]
+
     async def dequeue_rollout(self, worker_id: Optional[str] = None) -> Optional[AttemptedRollout]:
         self.calls.append(("dequeue_rollout", (worker_id,), {}))
         return self.return_values["dequeue_rollout"]
 
-    async def start_attempt(self, rollout_id: str) -> AttemptedRollout:
-        self.calls.append(("start_attempt", (rollout_id,), {}))
+    async def dequeue_many_rollouts(
+        self,
+        *,
+        limit: int = 1,
+        worker_id: Optional[str] = None,
+    ) -> Sequence[AttemptedRollout]:
+        self.calls.append(("dequeue_many_rollouts", (), {"limit": limit, "worker_id": worker_id}))
+        return self.return_values["dequeue_many_rollouts"]
+
+    async def start_attempt(self, rollout_id: str, worker_id: Optional[str] = None) -> AttemptedRollout:
+        self.calls.append(("start_attempt", (rollout_id, worker_id), {}))
         return self.return_values["start_attempt"]
 
     async def query_rollouts(self, *args: Any, **kwargs: Any) -> List[Rollout]:
@@ -101,9 +116,13 @@ class DummyLightningStore(LightningStore):
         self.calls.append(("query_resources", args, kwargs))
         return self.return_values["query_resources"]
 
-    async def add_span(self, span: Span) -> Span:
+    async def add_span(self, span: Span) -> Optional[Span]:
         self.calls.append(("add_span", (span,), {}))
         return self.return_values["add_span"]
+
+    async def add_many_spans(self, spans: Sequence[Span]) -> List[Span]:
+        self.calls.append(("add_many_spans", (spans,), {}))
+        return self.return_values["add_many_spans"]
 
     async def add_otel_span(
         self,
@@ -111,7 +130,7 @@ class DummyLightningStore(LightningStore):
         attempt_id: str,
         readable_span: ReadableSpan,
         sequence_id: Optional[int] = None,
-    ) -> Span:
+    ) -> Optional[Span]:
         self.calls.append(("add_otel_span", (rollout_id, attempt_id, readable_span, sequence_id), {}))
         return self.return_values["add_otel_span"]
 
@@ -122,6 +141,10 @@ class DummyLightningStore(LightningStore):
     async def get_next_span_sequence_id(self, rollout_id: str, attempt_id: str) -> int:
         self.calls.append(("get_next_span_sequence_id", (rollout_id, attempt_id), {}))
         return self.return_values["get_next_span_sequence_id"]
+
+    async def get_many_span_sequence_ids(self, rollout_attempt_ids: Sequence[Tuple[str, str]]) -> List[int]:
+        self.calls.append(("get_many_span_sequence_ids", (rollout_attempt_ids,), {}))
+        return self.return_values["get_many_span_sequence_ids"]
 
     async def query_spans(self, *args: Any, **kwargs: Any) -> List[Span]:
         self.calls.append(("query_spans", args, kwargs))
@@ -206,10 +229,13 @@ def minimal_dummy_store() -> DummyLightningStore:
             "update_resources": None,
             "get_resources_by_id": None,
             "get_latest_resources": None,
+            "query_resources": [],
             "add_span": None,
+            "add_many_spans": [],
             "add_otel_span": None,
             "wait_for_rollouts": [],
             "get_next_span_sequence_id": 0,
+            "get_many_span_sequence_ids": [],
             "query_spans": [],
             "update_rollout": None,
             "update_attempt": None,

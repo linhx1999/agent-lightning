@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
-import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import (
@@ -25,15 +26,26 @@ from typing import (
     cast,
 )
 
+import aiologic
+
+from agentlightning.utils.metrics import MetricsBackend
+
 if TYPE_CHECKING:
     from typing import Self
 
 from pydantic import BaseModel, TypeAdapter
-from pymongo import AsyncMongoClient, ReadPreference, WriteConcern
+from pymongo import AsyncMongoClient, ReadPreference, ReturnDocument, WriteConcern
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.database import AsyncDatabase
-from pymongo.errors import CollectionInvalid, ConnectionFailure, DuplicateKeyError, OperationFailure, PyMongoError
+from pymongo.errors import (
+    BulkWriteError,
+    CollectionInvalid,
+    ConnectionFailure,
+    DuplicateKeyError,
+    OperationFailure,
+    PyMongoError,
+)
 from pymongo.read_concern import ReadConcern
 
 from agentlightning.types import (
@@ -47,7 +59,19 @@ from agentlightning.types import (
     Worker,
 )
 
-from .base import Collection, KeyValue, LightningCollections, Queue, normalize_filter_options, resolve_sort_options
+from .base import (
+    AtomicLabels,
+    AtomicMode,
+    Collection,
+    DuplicatedPrimaryKeyError,
+    KeyValue,
+    LightningCollections,
+    Queue,
+    ensure_numeric,
+    normalize_filter_options,
+    resolve_sort_options,
+    tracked,
+)
 
 T_model = TypeVar("T_model", bound=BaseModel)
 
@@ -55,10 +79,34 @@ T_generic = TypeVar("T_generic")
 
 T_mapping = TypeVar("T_mapping", bound=Mapping[str, Any])
 
+T_callable = TypeVar("T_callable", bound=Callable[..., Any])
+
 K = TypeVar("K")
 V = TypeVar("V")
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_mongo_error_type(exc: BaseException | None) -> str | None:
+    is_transient = isinstance(exc, PyMongoError) and exc.has_error_label("TransientTransactionError")
+    if isinstance(exc, OperationFailure):
+        if is_transient:
+            return f"OperationFailure-{exc.code}-Transient"
+        else:
+            return f"OperationFailure-{exc.code}"
+    if isinstance(exc, DuplicateKeyError):
+        return "DuplicateKeyError-Transient" if is_transient else "DuplicateKeyError"
+    if isinstance(exc, PyMongoError):
+        if is_transient:
+            return f"{exc.__class__.__name__}-Transient"
+        else:
+            return exc.__class__.__name__
+    if isinstance(exc, ConnectionFailure):
+        return "ConnectionFailure-Transient" if is_transient else "ConnectionFailure"
+    if is_transient:
+        return "Other-Transient"
+    else:
+        return None
 
 
 def _field_ops_to_conditions(field: str, ops: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -200,23 +248,18 @@ async def _ensure_collection(
 
 
 class MongoClientPool(Generic[T_mapping]):
-    """A pool of MongoDB clients, each binded to a specific event loop.
+    """A pool of MongoDB clients, each bound to a specific event loop.
 
-    This class is to resolve the issue of MongoDB client cannot be shared across event loops:
-
-    ```
-    Cannot use AsyncMongoClient in different event loop. AsyncMongoClient uses low-level asyncio APIs that bind it to the event loop it was created on.
-    ```
-
-    Use the client pool with a context manager to ensure all clients are closed when the context is exited.
+    The pool lazily creates `AsyncMongoClient` instances per event loop using the provided
+    connection parameters, ensuring we never try to reuse a client across loops.
     """
 
-    def __init__(self, client: AsyncMongoClient[T_mapping]):
-        self._lock = threading.Lock()
-
-        self._client_base = client
+    def __init__(self, *, mongo_uri: str, mongo_client_kwargs: Mapping[str, Any] | None = None):
+        self._get_collection_lock = aiologic.Lock()
+        self._get_client_lock = aiologic.Lock()
+        self._mongo_uri = mongo_uri
+        self._mongo_client_kwargs = dict(mongo_client_kwargs or {})
         self._client_pool: Dict[int, AsyncMongoClient[T_mapping]] = {}
-
         self._collection_pool: Dict[Tuple[int, str, str], AsyncCollection[T_mapping]] = {}
 
     async def __aenter__(self) -> Self:
@@ -226,18 +269,16 @@ class MongoClientPool(Generic[T_mapping]):
         await self.close()
 
     async def close(self) -> None:
-        """Close all clients in the pool (except the base client)."""
+        """Close all clients currently tracked by the pool."""
 
-        with self._lock:
+        async with self._get_client_lock, self._get_collection_lock:
             clients = list(self._client_pool.values())
             self._client_pool.clear()
+            self._collection_pool.clear()
 
         for client in clients:
             try:
-                if client is not self._client_base:
-                    await client.close()
-                else:
-                    logger.debug("Skipping closing base client: %s", client)
+                await client.close()
             except Exception:
                 logger.exception("Error closing MongoDB client: %s", client)
 
@@ -246,31 +287,22 @@ class MongoClientPool(Generic[T_mapping]):
         key = id(loop)
 
         # If there is already a client specifically for this loop, return it.
-        if key in self._client_pool:
-            # Verify that the client still works.
-            await self._client_pool[key].aconnect()
-            return self._client_pool[key]
+        existing = self._client_pool.get(key)
+        if existing is not None:
+            await existing.aconnect()  # This actually does nothing if the client is already connected.
+            return existing
 
-        try:
-            # Try whether the base client will work.
-            await self._client_base.aconnect()
+        async with self._get_client_lock:
+            # Another coroutine may have already created the client.
+            if key in self._client_pool:
+                await self._client_pool[key].aconnect()
+                return self._client_pool[key]
 
-            with self._lock:
-                # If it works, add it to the pool and return it.
-                self._client_pool.setdefault(key, self._client_base)
-            return self._client_base
-        except RuntimeError as exc:
-            if "Cannot use AsyncMongoClient in different event loop" in str(exc):
-                with self._lock:
-                    # Create a new client for this loop.
-                    client = self._client_base._duplicate()  # type: ignore
-                    # Try whether the new client will work.
-                    await client.aconnect()
-                    # Add it to the pool and return it.
-                    self._client_pool.setdefault(key, client)  # type: ignore
-                return client  # type: ignore
-
-            raise
+            # Create a new client for this loop.
+            client = AsyncMongoClient[T_mapping](self._mongo_uri, **self._mongo_client_kwargs)
+            await client.aconnect()
+            self._client_pool[key] = client
+            return client
 
     async def get_collection(self, database_name: str, collection_name: str) -> AsyncCollection[T_mapping]:
         loop = asyncio.get_running_loop()
@@ -278,12 +310,16 @@ class MongoClientPool(Generic[T_mapping]):
         if key in self._collection_pool:
             return self._collection_pool[key]
 
-        # Create a new collection for this loop.
-        client = await self.get_client()
-        collection = client[database_name][collection_name]
-        with self._lock:
+        async with self._get_collection_lock:
+            # Another coroutine may have already created the collection.
+            if key in self._collection_pool:
+                return self._collection_pool[key]
+
+            # Create a new collection for this loop.
+            client = await self.get_client()
+            collection = client[database_name][collection_name]
             self._collection_pool.setdefault(key, collection)
-        return collection
+            return collection
 
 
 class MongoBasedCollection(Collection[T_model]):
@@ -297,22 +333,22 @@ class MongoBasedCollection(Collection[T_model]):
         primary_keys: The primary keys of the collection.
         item_type: The type of the items in the collection.
         extra_indexes: The extra indexes to create on the collection.
+        tracker: The metrics tracker to use.
     """
 
     def __init__(
         self,
-        client_pool: MongoClientPool[Mapping[str, Any]] | AsyncMongoClient[Mapping[str, Any]],
+        client_pool: MongoClientPool[Mapping[str, Any]],
         database_name: str,
         collection_name: str,
         partition_id: str,
         primary_keys: Sequence[str],
         item_type: Type[T_model],
         extra_indexes: Sequence[Sequence[str]] = [],
+        tracker: MetricsBackend | None = None,
     ):
-        if isinstance(client_pool, AsyncMongoClient):
-            self._client_pool = MongoClientPool(client_pool)
-        else:
-            self._client_pool = client_pool
+        super().__init__(tracker=tracker)
+        self._client_pool = client_pool
         self._database_name = database_name
         self._collection_name = collection_name
         self._partition_id = partition_id
@@ -328,6 +364,17 @@ class MongoBasedCollection(Collection[T_model]):
             raise ValueError(f"item_type must be a subclass of BaseModel, got {item_type.__name__}")
         self._item_type = item_type
 
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
+
+    @property
+    def extra_tracking_labels(self) -> Mapping[str, str]:
+        return {
+            "database": self._database_name,
+        }
+
+    @tracked("ensure_collection")
     async def ensure_collection(self) -> AsyncCollection[Mapping[str, Any]]:
         """Ensure the backing MongoDB collection exists (and optionally its indexes).
 
@@ -353,6 +400,7 @@ class MongoBasedCollection(Collection[T_model]):
             primary_keys=self._primary_keys,
             item_type=self._item_type,
             extra_indexes=self._extra_indexes,
+            tracker=self._tracker,
         )
         collection._collection_created = self._collection_created
         collection._session = session
@@ -365,6 +413,7 @@ class MongoBasedCollection(Collection[T_model]):
     def item_type(self) -> Type[T_model]:
         return self._item_type
 
+    @tracked("size")
     async def size(self) -> int:
         collection = await self.ensure_collection()
         return await collection.count_documents({"partition_id": self._partition_id}, session=self._session)
@@ -378,6 +427,9 @@ class MongoBasedCollection(Collection[T_model]):
         pk_filter: Dict[str, Any] = {"partition_id": self._partition_id}
         pk_filter.update({pk: data[pk] for pk in self._primary_keys})
         return pk_filter
+
+    def _render_pk_values(self, values: Sequence[Any]) -> str:
+        return ", ".join(f"{pk}={value!r}" for pk, value in zip(self._primary_keys, values))
 
     def _ensure_item_type(self, item: T_model) -> None:
         if not isinstance(item, self._item_type):
@@ -406,6 +458,15 @@ class MongoBasedCollection(Collection[T_model]):
 
         return combined
 
+    def _model_validate_item(self, raw: Mapping[str, Any]) -> T_model:
+        item_type_has_id = "_id" in self._item_type.model_fields
+        # Remove _id from the raw document if the item type does not have it.
+        if not item_type_has_id:
+            raw = {k: v for k, v in raw.items() if k != "_id"}
+        # Convert Mongo document to Pydantic model
+        return self._item_type.model_validate(raw)  # type: ignore[arg-type]
+
+    @tracked("query")
     async def query(
         self,
         filter: Optional[FilterOptions] = None,
@@ -418,12 +479,11 @@ class MongoBasedCollection(Collection[T_model]):
         The handling of null-values in sorting is different from memory-based implementation.
         In MongoDB, null values are treated as less than non-null values.
         """
-        await self.ensure_collection()
+        collection = await self.ensure_collection()
 
         combined = self._inject_partition_filter(filter)
         mongo_filter = _build_mongo_filter(cast(FilterOptions, combined))
 
-        collection = await self.ensure_collection()
         total = await collection.count_documents(mongo_filter, session=self._session)
 
         if limit == 0:
@@ -447,25 +507,48 @@ class MongoBasedCollection(Collection[T_model]):
             cursor = cursor.limit(limit)
 
         items: List[T_model] = []
-        item_type_has_id = "_id" in self._item_type.model_fields
         async for raw in cursor:
-            # Remove _id from the raw document if the item type does not have it.
-            if not item_type_has_id:
-                raw.pop("_id", None)  # type: ignore
-            # Convert Mongo document to Pydantic model
-            items.append(self._item_type.model_validate(raw))  # type: ignore[arg-type]
+            items.append(self._model_validate_item(raw))
 
         return PaginatedResult[T_model](items=items, limit=limit, offset=offset, total=total)
 
+    @tracked("get")
     async def get(
         self,
         filter: Optional[FilterOptions] = None,
         sort: Optional[SortOptions] = None,
     ) -> Optional[T_model]:
-        result = await self.query(filter=filter, sort=sort, limit=1, offset=0)
-        return result.items[0] if result.items else None
+        collection = await self.ensure_collection()
 
+        combined = self._inject_partition_filter(filter)
+        mongo_filter = _build_mongo_filter(cast(FilterOptions, combined))
+
+        sort_name, sort_order = resolve_sort_options(sort)
+        mongo_sort: Optional[List[Tuple[str, int]]] = None
+        if sort_name is not None:
+            model_fields = getattr(self._item_type, "model_fields", {})
+            if sort_name not in model_fields:
+                raise ValueError(
+                    f"Failed to sort items by '{sort_name}': field does not exist on {self._item_type.__name__}"
+                )
+            direction = 1 if sort_order == "asc" else -1
+            mongo_sort = [(sort_name, direction)]
+
+        raw = await collection.find_one(mongo_filter, sort=mongo_sort, session=self._session)
+
+        if raw is None:
+            return None
+
+        return self._model_validate_item(raw)
+
+    @tracked("insert")
     async def insert(self, items: Sequence[T_model]) -> None:
+        """Insert items into the collection.
+
+        The implementation does NOT do checks for duplicate primary keys,
+        neither within the same insert call nor across different insert calls.
+        It relies on the database to enforce uniqueness via indexes.
+        """
         if not items:
             return
 
@@ -473,12 +556,6 @@ class MongoBasedCollection(Collection[T_model]):
         docs: List[Mapping[str, Any]] = []
         for item in items:
             self._ensure_item_type(item)
-            # Pre-check for existence to provide a clearer ValueError
-            pk_filter = self._pk_filter(item)
-            existing = await collection.find_one(pk_filter, session=self._session)
-            if existing is not None:
-                raise ValueError(f"Item with primary key(s) {pk_filter} already exists")
-
             doc = item.model_dump()
             doc["partition_id"] = self._partition_id
             docs.append(doc)
@@ -487,37 +564,115 @@ class MongoBasedCollection(Collection[T_model]):
             return
 
         try:
-            await collection.insert_many(docs, session=self._session)
+            async with self.tracking_context("insert.insert_many", self._collection_name):
+                await collection.insert_many(docs, session=self._session)
         except DuplicateKeyError as exc:
             # In case the DB enforces uniqueness via index, normalize to ValueError
-            raise ValueError("Duplicate key error while inserting items") from exc
+            raise DuplicatedPrimaryKeyError("Duplicated primary key(s) while inserting items") from exc
+        except BulkWriteError as exc:
+            write_errors = exc.details.get("writeErrors", [])
+            if write_errors and write_errors[0].get("code") == 11000:
+                raise DuplicatedPrimaryKeyError("Duplicated primary key(s) while inserting items") from exc
+            raise
 
-    async def update(self, items: Sequence[T_model]) -> None:
+    @tracked("update")
+    async def update(self, items: Sequence[T_model], update_fields: Sequence[str] | None = None) -> List[T_model]:
         if not items:
-            return
+            return []
 
+        updated_items: List[T_model] = []
         collection = await self.ensure_collection()
+
         for item in items:
             self._ensure_item_type(item)
             pk_filter = self._pk_filter(item)
             doc = item.model_dump()
             doc["partition_id"] = self._partition_id
-            result = await collection.replace_one(pk_filter, doc, session=self._session)
-            if result.matched_count == 0:
+
+            updated_doc = None
+
+            # Branch 1: Full Replace
+            if update_fields is None:
+                async with self.tracking_context("update.find_one_and_replace", self._collection_name):
+                    updated_doc = await collection.find_one_and_replace(
+                        filter=pk_filter,
+                        replacement=doc,
+                        session=self._session,
+                        return_document=ReturnDocument.AFTER,  # Returns the new version
+                    )
+
+            # Branch 2: Partial Update
+            else:
+                update_doc = {field: doc[field] for field in update_fields if field in doc}
+                async with self.tracking_context("update.find_one_and_update", self._collection_name):
+                    updated_doc = await collection.find_one_and_update(
+                        filter=pk_filter,
+                        update={"$set": update_doc},
+                        session=self._session,
+                        return_document=ReturnDocument.AFTER,  # Returns the new version
+                    )
+
+            # Validation and Reconstruction
+            if updated_doc is None:  # type: ignore
                 raise ValueError(f"Item with primary key(s) {pk_filter} does not exist")
 
-    async def upsert(self, items: Sequence[T_model]) -> None:
-        if not items:
-            return
+            # Re-instantiate the model from the raw MongoDB dictionary.
+            new_item = self._model_validate_item(updated_doc)
+            updated_items.append(new_item)
 
+        return updated_items
+
+    @tracked("upsert")
+    async def upsert(self, items: Sequence[T_model], update_fields: Sequence[str] | None = None) -> List[T_model]:
+        if not items:
+            return []
+
+        upserted_items: List[T_model] = []
         collection = await self.ensure_collection()
+
         for item in items:
             self._ensure_item_type(item)
             pk_filter = self._pk_filter(item)
-            doc = item.model_dump()
-            doc["partition_id"] = self._partition_id
-            await collection.replace_one(pk_filter, doc, upsert=True, session=self._session)
 
+            insert_doc = item.model_dump()
+            insert_doc["partition_id"] = self._partition_id
+
+            # If update_fields is None, we update ALL fields (standard upsert behavior).
+            # Otherwise, we only update specific fields, but insert the full doc if it's new.
+            target_fields = update_fields if update_fields is not None else list(insert_doc.keys())
+
+            # 1. $set: Fields that should be overwritten if the document exists
+            update_subset = {field: insert_doc[field] for field in target_fields if field in insert_doc}
+
+            # 2. $setOnInsert: Fields that are only set if we are creating a NEW document
+            # (Everything in the model that isn't in the update_subset)
+            set_on_insert = {k: v for k, v in insert_doc.items() if k not in update_subset}
+
+            update_spec: Dict[str, Dict[str, Any]] = {}
+            if set_on_insert:
+                update_spec["$setOnInsert"] = set_on_insert
+            if update_subset:
+                update_spec["$set"] = update_subset
+
+            async with self.tracking_context("upsert.find_one_and_update", self._collection_name):
+                result_doc = await collection.find_one_and_update(
+                    filter=pk_filter,
+                    update=update_spec,
+                    upsert=True,
+                    session=self._session,
+                    return_document=ReturnDocument.AFTER,
+                )
+
+            if result_doc is None:  # pyright: ignore[reportUnnecessaryComparison]
+                raise RuntimeError(f"Upsert resulted in no document for filter: {pk_filter}")
+
+            # Because upsert=True, result_doc is guaranteed to be not None
+            new_item = self._model_validate_item(result_doc)
+            upserted_items.append(new_item)
+
+        return upserted_items
+
+    @tracked("delete")
     async def delete(self, items: Sequence[T_model]) -> None:
         if not items:
             return
@@ -526,7 +681,8 @@ class MongoBasedCollection(Collection[T_model]):
         for item in items:
             self._ensure_item_type(item)
             pk_filter = self._pk_filter(item)
-            result = await collection.delete_one(pk_filter, session=self._session)
+            async with self.tracking_context("delete.delete_one", self._collection_name):
+                result = await collection.delete_one(pk_filter, session=self._session)
             if result.deleted_count == 0:
                 raise ValueError(f"Item with primary key(s) {pk_filter} does not exist")
 
@@ -539,11 +695,12 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
 
     def __init__(
         self,
-        client_pool: MongoClientPool[Mapping[str, Any]] | AsyncMongoClient[Mapping[str, Any]],
+        client_pool: MongoClientPool[Mapping[str, Any]],
         database_name: str,
         collection_name: str,
         partition_id: str,
         item_type: Type[T_generic],
+        tracker: MetricsBackend | None = None,
     ) -> None:
         """
         Args:
@@ -553,10 +710,8 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
             partition_id: Partition identifier; allows multiple logical queues in one collection.
             item_type: The Python type of queue items (primitive or BaseModel subclass).
         """
-        if isinstance(client_pool, AsyncMongoClient):
-            self._client_pool = MongoClientPool(client_pool)
-        else:
-            self._client_pool = client_pool
+        super().__init__(tracker=tracker)
+        self._client_pool = client_pool
         self._database_name = database_name
         self._collection_name = collection_name
         self._partition_id = partition_id
@@ -569,6 +724,17 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
     def item_type(self) -> Type[T_generic]:
         return self._item_type
 
+    @property
+    def extra_tracking_labels(self) -> Mapping[str, str]:
+        return {
+            "database": self._database_name,
+        }
+
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
+
+    @tracked("ensure_collection")
     async def ensure_collection(self) -> AsyncCollection[Mapping[str, Any]]:
         """Ensure the backing collection exists.
 
@@ -588,11 +754,13 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
             collection_name=self._collection_name,
             partition_id=self._partition_id,
             item_type=self._item_type,
+            tracker=self._tracker,
         )
         queue._collection_created = self._collection_created
         queue._session = session
         return queue
 
+    @tracked("has")
     async def has(self, item: T_generic) -> bool:
         collection = await self.ensure_collection()
         encoded = self._adapter.dump_python(item, mode="python")
@@ -606,6 +774,7 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
         )
         return doc is not None
 
+    @tracked("enqueue")
     async def enqueue(self, items: Sequence[T_generic]) -> Sequence[T_generic]:
         if not items:
             return []
@@ -624,9 +793,11 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
                 }
             )
 
-        await collection.insert_many(docs, session=self._session)
+        async with self.tracking_context("enqueue.insert_many", self.collection_name):
+            await collection.insert_many(docs, session=self._session)
         return list(items)
 
+    @tracked("dequeue")
     async def dequeue(self, limit: int = 1) -> Sequence[T_generic]:
         if limit <= 0:
             return []
@@ -636,16 +807,17 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
 
         # Atomic claim loop using find_one_and_update
         for _ in range(limit):
-            doc = await collection.find_one_and_update(
-                {
-                    "partition_id": self._partition_id,
-                    "consumed": False,
-                },
-                {"$set": {"consumed": True}},
-                sort=[("_id", 1)],  # FIFO using insertion order
-                return_document=True,
-                session=self._session,
-            )
+            async with self.tracking_context("dequeue.find_one_and_update", self.collection_name):
+                doc = await collection.find_one_and_update(
+                    {
+                        "partition_id": self._partition_id,
+                        "consumed": False,
+                    },
+                    {"$set": {"consumed": True}},
+                    sort=[("_id", 1)],  # FIFO using insertion order
+                    return_document=True,
+                    session=self._session,
+                )
             if doc is None:  # type: ignore
                 # No more items to dequeue
                 break
@@ -656,22 +828,24 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
 
         return results
 
+    @tracked("peek")
     async def peek(self, limit: int = 1) -> Sequence[T_generic]:
         if limit <= 0:
             return []
 
         collection = await self.ensure_collection()
-        cursor = (
-            collection.find(
-                {
-                    "partition_id": self._partition_id,
-                    "consumed": False,
-                },
-                session=self._session,
+        async with self.tracking_context("peek.find", self.collection_name):
+            cursor = (
+                collection.find(
+                    {
+                        "partition_id": self._partition_id,
+                        "consumed": False,
+                    },
+                    session=self._session,
+                )
+                .sort("_id", 1)
+                .limit(limit)
             )
-            .sort("_id", 1)
-            .limit(limit)
-        )
 
         items: list[T_generic] = []
         async for doc in cursor:
@@ -680,6 +854,7 @@ class MongoBasedQueue(Queue[T_generic], Generic[T_generic]):
 
         return items
 
+    @tracked("size")
     async def size(self) -> int:
         collection = await self.ensure_collection()
         return await collection.count_documents(
@@ -696,12 +871,13 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
 
     def __init__(
         self,
-        client_pool: MongoClientPool[Mapping[str, Any]] | AsyncMongoClient[Mapping[str, Any]],
+        client_pool: MongoClientPool[Mapping[str, Any]],
         database_name: str,
         collection_name: str,
         partition_id: str,
         key_type: Type[K],
         value_type: Type[V],
+        tracker: MetricsBackend | None = None,
     ) -> None:
         """
         Args:
@@ -711,11 +887,10 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
             partition_id: Partition identifier; allows multiple logical maps in one collection.
             key_type: The Python type of keys (primitive or BaseModel).
             value_type: The Python type of values (primitive or BaseModel).
+            tracker: The metrics tracker to use.
         """
-        if isinstance(client_pool, AsyncMongoClient):
-            self._client_pool = MongoClientPool(client_pool)
-        else:
-            self._client_pool = client_pool
+        super().__init__(tracker=tracker)
+        self._client_pool = client_pool
         self._database_name = database_name
         self._collection_name = collection_name
         self._partition_id = partition_id
@@ -727,6 +902,17 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
 
         self._session: Optional[AsyncClientSession] = None
 
+    @property
+    def extra_tracking_labels(self) -> Mapping[str, str]:
+        return {
+            "database": self._database_name,
+        }
+
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
+
+    @tracked("ensure_collection")
     async def ensure_collection(self, *, create_indexes: bool = True) -> AsyncCollection[Mapping[str, Any]]:
         """Ensure the backing collection exists (and optionally its indexes)."""
         if not self._collection_created:
@@ -744,12 +930,14 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
             partition_id=self._partition_id,
             key_type=self._key_type,
             value_type=self._value_type,
+            tracker=self._tracker,
         )
         key_value._collection_created = self._collection_created
         key_value._session = session
 
         return key_value
 
+    @tracked("has")
     async def has(self, key: K) -> bool:
         collection = await self.ensure_collection()
         encoded_key = self._key_adapter.dump_python(key, mode="python")
@@ -762,6 +950,7 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
         )
         return doc is not None
 
+    @tracked("get")
     async def get(self, key: K, default: V | None = None) -> V | None:
         collection = await self.ensure_collection()
         encoded_key = self._key_adapter.dump_python(key, mode="python")
@@ -778,28 +967,89 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
         raw_value = doc["value"]
         return self._value_adapter.validate_python(raw_value)
 
+    @tracked("set")
     async def set(self, key: K, value: V) -> None:
         collection = await self.ensure_collection()
         encoded_key = self._key_adapter.dump_python(key, mode="python")
         encoded_value = self._value_adapter.dump_python(value, mode="python")
         try:
-            await collection.replace_one(
-                {
-                    "partition_id": self._partition_id,
-                    "key": encoded_key,
-                },
-                {
-                    "partition_id": self._partition_id,
-                    "key": encoded_key,
-                    "value": encoded_value,
-                },
-                upsert=True,
-                session=self._session,
-            )
+            async with self.tracking_context("set.replace_one", self.collection_name):
+                await collection.replace_one(
+                    {
+                        "partition_id": self._partition_id,
+                        "key": encoded_key,
+                    },
+                    {
+                        "partition_id": self._partition_id,
+                        "key": encoded_key,
+                        "value": encoded_value,
+                    },
+                    upsert=True,
+                    session=self._session,
+                )
         except DuplicateKeyError as exc:
             # Very unlikely with replace_one+upsert, but normalize anyway.
-            raise ValueError("Duplicate key error while setting key-value item") from exc
+            raise DuplicatedPrimaryKeyError("Duplicate key error while setting key-value item") from exc
 
+    @tracked("inc")
+    async def inc(self, key: K, amount: V) -> V:
+        assert ensure_numeric(amount, description="amount")
+        collection = await self.ensure_collection()
+        encoded_key = self._key_adapter.dump_python(key, mode="python")
+        encoded_amount = self._value_adapter.dump_python(amount, mode="python")
+        try:
+            async with self.tracking_context("inc.find_one_and_update", self.collection_name):
+                doc = await collection.find_one_and_update(
+                    {
+                        "partition_id": self._partition_id,
+                        "key": encoded_key,
+                    },
+                    {
+                        "$inc": {"value": encoded_amount},
+                    },
+                    upsert=True,
+                    return_document=ReturnDocument.AFTER,
+                    session=self._session,
+                )
+        except OperationFailure as exc:
+            if exc.code == 14 or "Cannot apply $inc" in str(exc):
+                raise TypeError(f"value for key {key!r} is not numeric") from exc
+            raise
+        if doc is None:  # type: ignore
+            raise RuntimeError("Failed to increment value; MongoDB did not return a document")
+        raw_value = doc["value"]
+        return self._value_adapter.validate_python(raw_value)
+
+    @tracked("chmax")
+    async def chmax(self, key: K, value: V) -> V:
+        assert ensure_numeric(value, description="value")
+        collection = await self.ensure_collection()
+        encoded_key = self._key_adapter.dump_python(key, mode="python")
+        encoded_value = self._value_adapter.dump_python(value, mode="python")
+        try:
+            async with self.tracking_context("chmax.find_one_and_update", self.collection_name):
+                doc = await collection.find_one_and_update(
+                    {
+                        "partition_id": self._partition_id,
+                        "key": encoded_key,
+                    },
+                    {
+                        "$max": {"value": encoded_value},
+                    },
+                    upsert=True,
+                    return_document=ReturnDocument.AFTER,
+                    session=self._session,
+                )
+        except OperationFailure as exc:
+            if exc.code == 14 or "Cannot apply $max" in str(exc):
+                raise TypeError(f"value for key {key!r} is not numeric") from exc
+            raise
+        if doc is None:  # type: ignore
+            raise RuntimeError("Failed to update value; MongoDB did not return a document")
+        raw_value = doc["value"]
+        return self._value_adapter.validate_python(raw_value)
+
+    @tracked("pop")
     async def pop(self, key: K, default: V | None = None) -> V | None:
         collection = await self.ensure_collection()
         encoded_key = self._key_adapter.dump_python(key, mode="python")
@@ -816,6 +1066,7 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
         raw_value = doc["value"]
         return self._value_adapter.validate_python(raw_value)
 
+    @tracked("size")
     async def size(self) -> int:
         collection = await self.ensure_collection()
         return await collection.count_documents(
@@ -829,7 +1080,7 @@ class MongoBasedKeyValue(KeyValue[K, V], Generic[K, V]):
 class MongoLightningCollections(LightningCollections):
     """Mongo implementation of LightningCollections using MongoDB collections.
 
-    Serves as the storage base for [`MongoLightningStore`][agentlightning.store.MongoLightningStore].
+    Serves as the storage base for [`MongoLightningStore`][agentlightning.store.mongo.MongoLightningStore].
     """
 
     def __init__(
@@ -844,10 +1095,14 @@ class MongoLightningCollections(LightningCollections):
         workers: Optional[MongoBasedCollection[Worker]] = None,
         rollout_queue: Optional[MongoBasedQueue[str]] = None,
         span_sequence_ids: Optional[MongoBasedKeyValue[str, int]] = None,
+        tracker: MetricsBackend | None = None,
     ):
+        super().__init__(tracker=tracker, extra_labels=["database"])
         self._client_pool = client_pool
         self._database_name = database_name
         self._partition_id = partition_id
+        self._collection_ensured = False
+        self._lock = aiologic.Lock()  # used for generic atomic operations like scan debounce seconds
         self._rollouts = (
             rollouts
             if rollouts is not None
@@ -859,6 +1114,7 @@ class MongoLightningCollections(LightningCollections):
                 ["rollout_id"],
                 Rollout,
                 [["status"]],
+                tracker=self._tracker,
             )
         )
         self._attempts = (
@@ -872,6 +1128,7 @@ class MongoLightningCollections(LightningCollections):
                 ["rollout_id", "attempt_id"],
                 Attempt,
                 [["status"], ["sequence_id"]],
+                tracker=self._tracker,
             )
         )
         self._spans = (
@@ -885,6 +1142,7 @@ class MongoLightningCollections(LightningCollections):
                 ["rollout_id", "attempt_id", "span_id"],
                 Span,
                 [["sequence_id"]],
+                tracker=self._tracker,
             )
         )
         self._resources = (
@@ -898,30 +1156,61 @@ class MongoLightningCollections(LightningCollections):
                 ["resources_id"],
                 ResourcesUpdate,
                 ["update_time"],
+                tracker=self._tracker,
             )
         )
         self._workers = (
             workers
             if workers is not None
             else MongoBasedCollection(
-                self._client_pool, self._database_name, "workers", self._partition_id, ["worker_id"], Worker, ["status"]
+                self._client_pool,
+                self._database_name,
+                "workers",
+                self._partition_id,
+                ["worker_id"],
+                Worker,
+                ["status"],
+                tracker=self._tracker,
             )
         )
         self._rollout_queue = (
             rollout_queue
             if rollout_queue is not None
-            else MongoBasedQueue(self._client_pool, self._database_name, "rollout_queue", self._partition_id, str)
+            else MongoBasedQueue(
+                self._client_pool,
+                self._database_name,
+                "rollout_queue",
+                self._partition_id,
+                str,
+                tracker=self._tracker,
+            )
         )
         self._span_sequence_ids = (
             span_sequence_ids
             if span_sequence_ids is not None
             else MongoBasedKeyValue(
-                self._client_pool, self._database_name, "span_sequence_ids", self._partition_id, str, int
+                self._client_pool,
+                self._database_name,
+                "span_sequence_ids",
+                self._partition_id,
+                str,
+                int,
+                tracker=self._tracker,
             )
         )
 
+    @property
+    def collection_name(self) -> str:
+        return "router"  # Special collection name for tracking transactions
+
+    @property
+    def extra_tracking_labels(self) -> Mapping[str, str]:
+        return {
+            "database": self._database_name,
+        }
+
     def with_session(self, session: AsyncClientSession) -> Self:
-        return self.__class__(
+        instance = self.__class__(
             client_pool=self._client_pool,
             database_name=self._database_name,
             partition_id=self._partition_id,
@@ -932,7 +1221,10 @@ class MongoLightningCollections(LightningCollections):
             workers=self._workers.with_session(session),
             rollout_queue=self._rollout_queue.with_session(session),
             span_sequence_ids=self._span_sequence_ids.with_session(session),
+            tracker=self._tracker,
         )
+        instance._collection_ensured = self._collection_ensured
+        return instance
 
     @property
     def rollouts(self) -> MongoBasedCollection[Rollout]:
@@ -962,8 +1254,11 @@ class MongoLightningCollections(LightningCollections):
     def span_sequence_ids(self) -> MongoBasedKeyValue[str, int]:
         return self._span_sequence_ids
 
+    @tracked("ensure_collections")
     async def _ensure_collections(self) -> None:
         """Ensure all collections exist."""
+        if self._collection_ensured:
+            return
         await self._rollouts.ensure_collection()
         await self._attempts.ensure_collection()
         await self._spans.ensure_collection()
@@ -971,56 +1266,150 @@ class MongoLightningCollections(LightningCollections):
         await self._workers.ensure_collection()
         await self._rollout_queue.ensure_collection()
         await self._span_sequence_ids.ensure_collection()
+        self._collection_ensured = True
 
     @asynccontextmanager
-    async def atomic(self, *args: Any, **kwargs: Any):
-        """Perform a atomic operation on the collections."""
-        # First step: ensure all collections exist before going into the atomic block
-        await self._ensure_collections()
-        # One session for one transaction
-        client = await self._client_pool.get_client()
-        async with client.start_session() as session:
-            collection_with_session = self.with_session(session)
+    async def _lock_manager(self, labels: Optional[Sequence[AtomicLabels]]):
+        if labels is None or "generic" not in labels:
+            yield
+
+        else:
+            # Only lock the generic label.
             try:
-                # Start the transaction now
-                await session.start_transaction(
-                    write_concern=WriteConcern("majority"),
-                    read_concern=ReadConcern("local"),
-                    read_preference=ReadPreference.PRIMARY,
-                )
-                yield collection_with_session
-                # Commit the transaction
-                await session.commit_transaction()
+                async with self.tracking_context("lock", self.collection_name):
+                    await self._lock.async_acquire()
+                yield
+            finally:
+                self._lock.async_release()
+
+    @asynccontextmanager
+    async def atomic(
+        self,
+        mode: AtomicMode = "rw",
+        snapshot: bool = False,
+        commit: bool = False,
+        labels: Optional[Sequence[AtomicLabels]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        """Perform a atomic operation on the collections."""
+        if commit:
+            raise ValueError("Commit should be used with execute() instead.")
+        async with self._lock_manager(labels):
+            async with self.tracking_context("atomic", self.collection_name):
+                # First step: ensure all collections exist before going into the atomic block
+                if not self._collection_ensured:
+                    await self._ensure_collections()
+                # Execute directly without commit
+                yield self
+
+    @tracked("execute")
+    async def execute(
+        self,
+        callback: Callable[[Self], Awaitable[T_generic]],
+        *,
+        mode: AtomicMode = "rw",
+        snapshot: bool = False,
+        commit: bool = False,
+        labels: Optional[Sequence[AtomicLabels]] = None,
+        **kwargs: Any,
+    ) -> T_generic:
+        """Execute the given callback within an atomic operation, and with retries on transient errors."""
+        if not self._collection_ensured:
+            await self._ensure_collections()
+        client = await self._client_pool.get_client()
+
+        # If commit is not turned on, just execute the callback directly.
+        if not commit:
+            async with self._lock_manager(labels):
+                return await callback(self)
+
+        # If snapshot is enabled, use snapshot read concern.
+        read_concern = ReadConcern("snapshot") if snapshot else ReadConcern("local")
+        # If mode is "r", write_concern is not needed.
+        write_concern = WriteConcern("majority") if mode != "r" else None
+
+        async with client.start_session() as session:
+            collections = self.with_session(session)
+            try:
+                async with self._lock_manager(labels):
+                    return await self.with_transaction(session, collections, callback, read_concern, write_concern)
+            except (ConnectionFailure, OperationFailure) as exc:
+                # Un-retryable errors.
+                raise RuntimeError("Transaction failed with connection or operation error") from exc
+
+    @tracked("with_transaction")
+    async def with_transaction(
+        self,
+        session: AsyncClientSession,
+        collections: Self,
+        callback: Callable[[Self], Awaitable[T_generic]],
+        read_concern: ReadConcern,
+        write_concern: Optional[WriteConcern],
+    ) -> T_generic:
+        # This will start a transaction, run transaction callback, and commit.
+        # It will also transparently retry on some transient errors.
+        # Expanded implementation of with_transaction from client_session
+        read_preference = ReadPreference.PRIMARY
+        transaction_retry_time_limit = 120
+        start_time = time.monotonic()
+
+        def _within_time_limit() -> bool:
+            return time.monotonic() - start_time < transaction_retry_time_limit
+
+        async def _jitter_before_retry() -> None:
+            async with self.tracking_context("execute.jitter", self.collection_name):
+                await asyncio.sleep(random.uniform(0, 0.05))
+
+        while True:
+            await session.start_transaction(read_concern, write_concern, read_preference)
+
+            try:
+                # The _session is always the same within one transaction,
+                # so we can use the same collections object.
+                async with self.tracking_context("execute.callback", self.collection_name):
+                    ret = await callback(collections)
             # Catch KeyboardInterrupt, CancelledError, etc. and cleanup.
             except BaseException as exc:
                 if session.in_transaction:
                     await session.abort_transaction()
-                if isinstance(exc, PyMongoError) and exc.has_error_label("TransientTransactionError"):
-                    # NOTE: Retry is via execute
-                    raise RuntimeError("Transaction failed with transient error") from exc
+                if (
+                    isinstance(exc, PyMongoError)
+                    and exc.has_error_label("TransientTransactionError")
+                    and _within_time_limit()
+                ):
+                    # Retry the entire transaction.
+                    await _jitter_before_retry()
+                    continue
                 raise
 
-    async def execute(self, callback: Callable[[Self], Awaitable[T_generic]]) -> T_generic:
-        """Execute the given callback within an atomic operation, and with retries on transient errors."""
-        await self._ensure_collections()
-        client = await self._client_pool.get_client()
+            if not session.in_transaction:
+                # Assume callback intentionally ended the transaction.
+                return ret
 
-        async with client.start_session() as session:
-            collections = self.with_session(session)
+            # Tracks the commit operation.
+            async with self.tracking_context("execute.commit", self.collection_name):
+                # Loop until the commit succeeds or we hit the time limit.
+                while True:
+                    # Tracks the commit attempt.
+                    try:
+                        async with self.tracking_context("execute.commit_once", self.collection_name):
+                            await session.commit_transaction()
+                    except PyMongoError as exc:
+                        if (
+                            exc.has_error_label("UnknownTransactionCommitResult")
+                            and _within_time_limit()
+                            and not (isinstance(exc, OperationFailure) and exc.code == 50)  # max_time_expired_error
+                        ):
+                            # Retry the commit.
+                            await _jitter_before_retry()
+                            continue
 
-            async def _txn_callback(_session: AsyncClientSession) -> T_generic:
-                # The _session is always the same within one transaction,
-                # so we can use the same collections object.
-                return await callback(collections)
+                        if exc.has_error_label("TransientTransactionError") and _within_time_limit():
+                            # Retry the entire transaction.
+                            await _jitter_before_retry()
+                            break
+                        raise
 
-            try:
-                # This will start a transaction, run transaction callback, and commit.
-                # It will also transparently retry on some transient errors.
-                return await session.with_transaction(
-                    _txn_callback,
-                    read_concern=ReadConcern("local"),
-                    write_concern=WriteConcern("majority"),
-                    read_preference=ReadPreference.PRIMARY,
-                )
-            except (ConnectionFailure, OperationFailure) as exc:
-                raise RuntimeError("Transaction failed with connection or operation error") from exc
+                    # Commit succeeded.
+                    return ret

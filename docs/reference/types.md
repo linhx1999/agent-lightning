@@ -22,6 +22,8 @@
 
 ::: agentlightning.Rollout
 
+::: agentlightning.EnqueueRolloutRequest
+
 ::: agentlightning.Attempt
 
 ::: agentlightning.AttemptedRollout
@@ -76,8 +78,20 @@
 
 ::: agentlightning.Span
 
-::: agentlightning.SpanNames
-
 ::: agentlightning.SpanAttributeNames
 
 ::: agentlightning.SpanLike
+
+::: agentlightning.SpanCoreFields
+
+::: agentlightning.SpanRecordingContext
+
+## Environment Variables
+
+::: agentlightning.LightningEnvVar
+
+::: agentlightning.resolve_bool_env_var
+
+::: agentlightning.resolve_int_env_var
+
+::: agentlightning.resolve_str_env_var

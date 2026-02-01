@@ -32,13 +32,7 @@ from agentlightning.types import LLM, Span
 from ..common.tracer import clear_tracer_provider
 from ..common.vllm import VLLM_VERSION, RemoteOpenAIServer
 
-try:
-    import torch  # type: ignore
-
-    GPU_AVAILABLE = torch.cuda.is_available()
-except Exception:
-    GPU_AVAILABLE = False  # type: ignore
-    pytest.skip(reason="GPU not available", allow_module_level=True)
+pytestmark = [pytest.mark.gpu, pytest.mark.llmproxy]
 
 
 @pytest.fixture(scope="module")
@@ -127,6 +121,7 @@ async def test_basic_integration(qwen25_model: RemoteOpenAIServer, otlp_enabled:
         print(f">>> Span: {span.name}")
         print(f">>> Start time: {span.start_time}")
         print(f">>> End time: {span.end_time}")
+        print(f">>> Attributes: {span.attributes.keys()}")
         assert span.start_time is not None, f"Span {span.name} has no start time"
         assert span.end_time is not None, f"Span {span.name} has no end time"
 
